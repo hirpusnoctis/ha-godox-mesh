@@ -272,9 +272,9 @@ class GodoxController:
                 logger.debug("proxy notification received (type=0x%02x): %s", pdu_type, pdu.hex())
                 self._handle_response(pdu)
 
-        await self._client.start_notify(on_proxy_notify)
-        logger.debug("proxy notifications started")
         try:
+            await self._client.start_notify(on_proxy_notify)
+            logger.debug("proxy notifications started")
             # Echo the Secure Network Beacon back to the device before proxy config.
             # This step is required by the Bluetooth Mesh proxy protocol: the proxy client
             # must echo the beacon to establish itself as a trusted bearer.
@@ -305,6 +305,14 @@ class GodoxController:
                 label="whitelist",
             )
             logger.debug("proxy notifications left active for session")
+        except BaseException:
+            # A failed subscribe or filter write leaves a connected BLE client
+            # without a usable proxy session. Release it before another try.
+            try:
+                await self._client.disconnect()
+            except Exception as err:  # noqa: BLE001 - keep the original failure
+                logger.debug("error closing failed proxy setup: %s", err)
+            raise
         finally:
             logger.debug("proxy initialization complete")
 
@@ -327,9 +335,13 @@ class GodoxController:
             logger.debug("waiting %.2fs for control write to settle", CONTROL_SETTLE_SECONDS)
             await asyncio.sleep(CONTROL_SETTLE_SECONDS)
             self._control_write_pending = False
-        await self._client.stop_notify()
-        logger.debug("proxy notifications stopped")
-        await self._client.disconnect()
+        try:
+            await self._client.stop_notify()
+        except Exception as err:  # noqa: BLE001 - disconnect must still run
+            logger.debug("proxy notify session already gone: %s", err)
+        finally:
+            await self._client.disconnect()
+        logger.debug("proxy notifications stopped and client disconnected")
 
     def _advance_state(self) -> None:
         self.state = self.state.next_sequence()

@@ -37,6 +37,7 @@ def connected(mesh_state: MeshState):
     client.start_notify = AsyncMock()
     client.stop_notify = AsyncMock()
     client.is_connected = True
+    client.max_write_without_response_size = 100
     controller = GodoxController(
         "AA:BB:CC:DD:EE:FF", state=mesh_state, client_factory=lambda a: client
     )
@@ -83,6 +84,27 @@ async def test_request_status_sends_the_status_request_frame(mesh_state) -> None
     assert (status.brightness, status.cct) == (10, 2700)
     sent = client.write_gatt_char.await_args_list[0].args[1]
     assert sent[0] == 0x00  # proxy network PDU
+
+
+@pytest.mark.asyncio
+async def test_segmented_status_notification_answers_request(mesh_state) -> None:
+    """A status reply split by GATT must reach the controller as one PDU."""
+    controller, client = connected(mesh_state)
+    await controller._client.start_notify(controller._handle_response)
+    notify = client.start_notify.call_args.args[1]
+    reply = bytes.fromhex("a00a1b32ffff01f9")
+
+    async def answer() -> None:
+        await asyncio.sleep(0)
+        body = status_pdu(mesh_state, reply)[1:]
+        notify("char", bytearray(b"\x40" + body[:19]))
+        notify("char", bytearray(b"\xc0" + body[19:]))
+
+    task = asyncio.create_task(answer())
+    status = await controller.request_status(timeout=1.0)
+    await task
+
+    assert (status.brightness, status.cct) == (10, 2700)
 
 
 @pytest.mark.asyncio

@@ -59,14 +59,13 @@ async def test_controller_send_v2_command(tmp_path, mesh_state) -> None:
     # Send Power On
     await controller.power_on()
     
-    # Verify write was called
-    mock_client.write_gatt_char.assert_called_once()
-    args, kwargs = mock_client.write_gatt_char.call_args
-    # proxy characteristic
-    assert args[0] == "00002add-0000-1000-8000-00805f9b34fb"
-    # value (Proxy PDU)
-    pdu = args[1]
-    assert pdu[0] == 0x00 # SAR 0, Type 0
+    # A network PDU is longer than a minimum-MTU GATT write. It reaches the
+    # characteristic as two Proxy SAR fragments, but consumes one mesh sequence.
+    writes = [call.args[1] for call in mock_client.write_gatt_char.await_args_list]
+    assert len(writes) == 2
+    assert writes[0][0] == 0x40  # first, network PDU
+    assert writes[1][0] == 0xC0  # last, network PDU
+    assert all(len(write) <= 20 for write in writes)
     
     # Verify state advancement
     new_state = MeshState.load(state_file)
@@ -109,6 +108,48 @@ async def test_controller_disconnect_waits_for_control_write_to_settle(
     sleep.assert_awaited_once_with(CONTROL_SETTLE_SECONDS)
     mock_client.stop_notify.assert_awaited_once()
     mock_client.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_controller_disconnect_survives_lost_notify_session(mesh_state) -> None:
+    """A vanished BlueZ notify session must not strand the BLE connection."""
+    mock_client = MagicMock()
+    mock_client.is_connected = True
+    mock_client.stop_notify = AsyncMock(
+        side_effect=RuntimeError("No notify session started")
+    )
+    mock_client.disconnect = AsyncMock()
+    controller = GodoxController(
+        "AA:BB:CC:DD:EE:FF", state=mesh_state,
+        client_factory=lambda _address: mock_client,
+    )
+    controller._client._client = mock_client
+    controller._client._notifications_started = True
+
+    await controller.disconnect()
+
+    mock_client.disconnect.assert_awaited_once()
+    assert not controller.is_connected
+
+
+@pytest.mark.asyncio
+async def test_controller_connect_cleans_up_after_notify_start_failure(mesh_state) -> None:
+    """A half-open connection must not be reused by the next attempt."""
+    mock_client = MagicMock()
+    mock_client.is_connected = True
+    mock_client.connect = AsyncMock()
+    mock_client.start_notify = AsyncMock(side_effect=RuntimeError("notify failed"))
+    mock_client.disconnect = AsyncMock()
+    controller = GodoxController(
+        "AA:BB:CC:DD:EE:FF", state=mesh_state,
+        client_factory=lambda _address: mock_client,
+    )
+
+    with pytest.raises(RuntimeError, match="notify failed"):
+        await controller.connect()
+
+    mock_client.disconnect.assert_awaited_once()
+    assert not controller.is_connected
 
 
 @pytest.mark.asyncio
@@ -202,11 +243,16 @@ async def test_controller_connect_writes_proxy_config_from_current_state(
             "src": mesh_state.provisioner_address,
         },
     ]
-    # 3 writes: beacon echo (type=0x01) + filter type (type=0x02) + whitelist (type=0x02)
+    # The 23-byte beacon echo is segmented; both short filter PDUs stay whole.
     assert mock_client.write_gatt_char.call_args_list == [
         call(
             "00002add-0000-1000-8000-00805f9b34fb",
-            BEACON_PDU,
+            b"\x41" + BEACON_PDU[1:20],
+            response=False,
+        ),
+        call(
+            "00002add-0000-1000-8000-00805f9b34fb",
+            b"\xc1" + BEACON_PDU[20:],
             response=False,
         ),
         call(

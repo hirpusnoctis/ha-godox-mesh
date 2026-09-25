@@ -12,6 +12,7 @@ from custom_components.godox_mesh.const import (
 )
 from custom_components.godox_mesh.store import KEY_SEQUENCE_NUMBER, SAVE_DELAY_SECONDS
 from custom_components.godox_mesh._lib import GodoxController
+from custom_components.godox_mesh._lib.protocol import parse_status_response
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     SERVICE_TURN_OFF,
@@ -167,6 +168,32 @@ async def test_a_run_of_failures_forces_a_reconnect(
 
     # The next command opens a fresh connection instead of reusing the dead one.
     await _turn_on(hass)
+    assert len(fake_ble) == 2
+    assert fake_ble[1].is_connected
+
+
+async def test_failed_polls_reconnect_after_notify_session_disappears(
+    hass: HomeAssistant, setup_entry, fake_ble
+) -> None:
+    """A vanished BlueZ notify session cannot trap subsequent polls on one link."""
+    await _turn_on(hass)
+    fake_ble[0].stop_notify = AsyncMock(
+        side_effect=RuntimeError("No notify session started")
+    )
+    link = setup_entry.runtime_data.link
+    with patch.object(
+        GodoxController,
+        "request_status",
+        AsyncMock(side_effect=TimeoutError("no status reply")),
+    ):
+        for _ in range(MAX_CONSECUTIVE_FAILURES):
+            with pytest.raises(HomeAssistantError, match="no status reply"):
+                await link.async_request_status(2)
+
+    assert not fake_ble[0].is_connected
+    status = parse_status_response(bytes.fromhex("a00a1b32ffff01f9"))
+    with patch.object(GodoxController, "request_status", AsyncMock(return_value=status)):
+        assert await link.async_request_status(2) == status
     assert len(fake_ble) == 2
     assert fake_ble[1].is_connected
 

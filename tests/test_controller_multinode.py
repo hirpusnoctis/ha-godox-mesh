@@ -142,7 +142,8 @@ async def test_sequence_number_is_shared_across_nodes(mesh_state) -> None:
     await controller.power_on(dst=0x0004)
 
     assert controller.state.sequence_number == 4
-    assert client.write_gatt_char.await_count == 3
+    # One network PDU per node, each carried in two minimum-MTU GATT writes.
+    assert client.write_gatt_char.await_count == 6
 
 
 @pytest.mark.asyncio
@@ -256,4 +257,5 @@ async def test_connect_completes_within_the_configured_timeouts(mesh_state) -> N
 
     assert elapsed < 1.0
     # Filter type and whitelist were still sent despite no acknowledgement.
-    assert client.write_gatt_char.await_count == 2
+    # The whitelist Proxy PDU needs two GATT segments at the minimum MTU.
+    assert client.write_gatt_char.await_count == 3

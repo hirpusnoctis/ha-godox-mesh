@@ -8,7 +8,9 @@ Examples
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -22,6 +24,16 @@ DeviceResolver = Callable[[str], Awaitable[Any | None]]
 
 MESH_PROXY_DATA_IN_UUID = "00002add-0000-1000-8000-00805f9b34fb"
 MESH_PROXY_DATA_OUT_UUID = "00002ade-0000-1000-8000-00805f9b34fb"
+
+# The Proxy header carries two SAR bits above its six-bit message type. A
+# minimum ATT MTU of 23 leaves 20 bytes for each characteristic value.
+_SAR_COMPLETE = 0
+_SAR_FIRST = 1
+_SAR_CONTINUATION = 2
+_SAR_LAST = 3
+_DEFAULT_WRITE_SIZE = 20
+_SAR_TIMEOUT_SECONDS = 20.0
+_MAX_PROXY_MESSAGE_BYTES = 384
 
 
 class ProxyClient:
@@ -52,6 +64,10 @@ class ProxyClient:
         self._client: Any | None = None
         self._callbacks: list[NotificationCallback] = []
         self._notifications_started = False
+        self._write_lock = asyncio.Lock()
+        self._rx_type: int | None = None
+        self._rx_body = bytearray()
+        self._rx_started_at = 0.0
 
     @property
     def is_connected(self) -> bool:
@@ -102,10 +118,10 @@ class ProxyClient:
         # below would be skipped and the device's beacon never seen again.
         self._notifications_started = False
         self._callbacks.clear()
+        self._reset_reassembly()
         self._client = self._client_factory(self.address)
         await self._client.connect()
-        mtu = getattr(self._client, "mtu_size", None)
-        logger.debug("proxy client connected (MTU=%s)", mtu)
+        logger.debug("proxy client connected (GATT write limit=%s)", self._max_write_size())
 
     async def disconnect(self) -> None:
         """Disconnect the proxy client and clear notification callbacks.
@@ -132,10 +148,45 @@ class ProxyClient:
         if self._client is None:
             return
         logger.debug("disconnecting proxy client from %s", self.address)
-        await self._client.disconnect()
-        self._notifications_started = False
-        self._callbacks.clear()
+        client = self._client
+        try:
+            if self._notifications_started:
+                try:
+                    await self.stop_notify()
+                except Exception as err:  # noqa: BLE001 - teardown still must continue
+                    logger.debug("proxy notify session already gone: %s", err)
+            await client.disconnect()
+        finally:
+            # A failed StopNotify or disconnect must never leave the old client
+            # looking connected to the next poll or command.
+            self._client = None
+            self._notifications_started = False
+            self._callbacks.clear()
+            self._reset_reassembly()
         logger.debug("proxy client disconnected")
+
+    def _max_write_size(self) -> int:
+        """Return the GATT write limit, conservatively defaulting to 20 bytes.
+
+        BlueZ can report its default MTU of 23 even after negotiating a larger
+        one. Home Assistant's transport supplies the safe write limit directly;
+        direct Bleak clients may expose either that value or a usable MTU.
+        """
+        assert self._client is not None
+        size = getattr(self._client, "max_write_without_response_size", None)
+        if isinstance(size, int) and size >= 2:
+            return size
+        services = getattr(self._client, "services", None)
+        get_characteristic = getattr(services, "get_characteristic", None)
+        if callable(get_characteristic):
+            characteristic = get_characteristic(MESH_PROXY_DATA_IN_UUID)
+            size = getattr(characteristic, "max_write_without_response_size", None)
+            if isinstance(size, int) and size >= 2:
+                return size
+        mtu = getattr(self._client, "mtu_size", None)
+        if isinstance(mtu, int) and mtu >= 5:
+            return mtu - 3
+        return _DEFAULT_WRITE_SIZE
 
     async def write_proxy(self, data: bytes) -> None:
         """Write a complete Mesh Proxy PDU to Data In.
@@ -171,16 +222,76 @@ class ProxyClient:
 
         if not self.is_connected or self._client is None:
             raise RuntimeError("proxy client is not connected")
-        mtu = getattr(self._client, "mtu_size", None)
-        max_write = (mtu - 3) if (mtu is not None and isinstance(mtu, int)) else None
-        if max_write is not None and len(data) > max_write:
-            logger.warning(
-                "write %d bytes exceeds MTU max payload %d — may be silently dropped",
-                len(data),
-                max_write,
+        if not data or data[0] & 0xC0:
+            raise ValueError("write_proxy expects a complete Proxy PDU")
+        max_write = self._max_write_size()
+        message_type = data[0] & 0x3F
+        body = data[1:]
+        async with self._write_lock:
+            if len(data) <= max_write:
+                logger.debug("writing %d proxy byte(s)", len(data))
+                await self._client.write_gatt_char(
+                    MESH_PROXY_DATA_IN_UUID, data, response=False
+                )
+                return
+            segment_size = max_write - 1
+            logger.debug(
+                "segmenting %d-byte proxy PDU into %d-byte GATT writes",
+                len(data), max_write,
             )
-        logger.debug("writing %d proxy byte(s) [hex: %s]", len(data), data.hex())
-        await self._client.write_gatt_char(MESH_PROXY_DATA_IN_UUID, data, response=False)
+            for start in range(0, len(body), segment_size):
+                end = start + segment_size
+                sar = (
+                    _SAR_FIRST if start == 0 else
+                    _SAR_LAST if end >= len(body) else _SAR_CONTINUATION
+                )
+                segment = bytes([(sar << 6) | message_type]) + body[start:end]
+                await self._client.write_gatt_char(
+                    MESH_PROXY_DATA_IN_UUID, segment, response=False
+                )
+
+    def _reset_reassembly(self) -> None:
+        self._rx_type = None
+        self._rx_body.clear()
+        self._rx_started_at = 0.0
+
+    def _reassemble(self, fragment: bytes) -> bytes | None:
+        """Return a complete Proxy PDU after all GATT segments have arrived."""
+        if not fragment:
+            return None
+        header = fragment[0]
+        sar = header >> 6
+        message_type = header & 0x3F
+        body = fragment[1:]
+        logger.debug(
+            "proxy GATT notification SAR=%d type=0x%02x bytes=%d",
+            sar, message_type, len(fragment),
+        )
+        if sar == _SAR_COMPLETE:
+            self._reset_reassembly()
+            return bytes([message_type]) + body
+        if sar == _SAR_FIRST:
+            self._reset_reassembly()
+            if not body or len(body) > _MAX_PROXY_MESSAGE_BYTES:
+                return None
+            self._rx_type = message_type
+            self._rx_body.extend(body)
+            self._rx_started_at = time.monotonic()
+            return None
+        if (
+            self._rx_type != message_type
+            or self._rx_type is None
+            or time.monotonic() - self._rx_started_at > _SAR_TIMEOUT_SECONDS
+            or len(self._rx_body) + len(body) > _MAX_PROXY_MESSAGE_BYTES
+        ):
+            self._reset_reassembly()
+            return None
+        self._rx_body.extend(body)
+        if sar == _SAR_CONTINUATION:
+            return None
+        complete = bytes([message_type]) + bytes(self._rx_body)
+        self._reset_reassembly()
+        return complete
 
     async def start_notify(self, callback: NotificationCallback) -> None:
         """Start Mesh Proxy Data Out notifications.
@@ -222,7 +333,9 @@ class ProxyClient:
         logger.debug("starting proxy notifications on %s", MESH_PROXY_DATA_OUT_UUID)
 
         def bleak_callback(_characteristic: Any, data: bytearray) -> None:
-            pdu = bytes(data)
+            pdu = self._reassemble(bytes(data))
+            if pdu is None:
+                return
             for cb in list(self._callbacks):
                 cb(pdu)
 
@@ -268,9 +381,12 @@ class ProxyClient:
                 return
 
         logger.debug("stopping proxy notifications on %s", MESH_PROXY_DATA_OUT_UUID)
-        await self._client.stop_notify(MESH_PROXY_DATA_OUT_UUID)
-        self._notifications_started = False
-        self._callbacks.clear()
+        try:
+            await self._client.stop_notify(MESH_PROXY_DATA_OUT_UUID)
+        finally:
+            self._notifications_started = False
+            self._callbacks.clear()
+            self._reset_reassembly()
 
 
 class GodoxMeshClient:

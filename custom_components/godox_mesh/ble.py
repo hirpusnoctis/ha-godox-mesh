@@ -25,6 +25,10 @@ _LOGGER = logging.getLogger(__name__)
 
 CONNECT_TIMEOUT = 20.0
 
+# ATT guarantees at least 20 characteristic bytes even when BlueZ does not
+# expose the negotiated MTU. The Mesh Proxy bearer segments anything longer.
+SAFE_PROXY_WRITE_SIZE = 20
+
 
 class DeviceNotFound(Exception):
     """Raised when the Bluetooth manager cannot currently see the light."""
@@ -112,6 +116,11 @@ class HomeAssistantBleakClient:
         if self._client is None:
             return None
         return self._client.mtu_size
+
+    @property
+    def max_write_without_response_size(self) -> int:
+        """Use a portable GATT limit instead of BlueZ's unreliable MTU value."""
+        return SAFE_PROXY_WRITE_SIZE
 
     def _resolve(self) -> Any:
         return bluetooth.async_ble_device_from_address(
