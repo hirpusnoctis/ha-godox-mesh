@@ -251,6 +251,7 @@ report something will always show you what Home Assistant last sent it:
 | Brightness | yes | — reliable on every light tested, panel changes included |
 | Colour temperature | yes, **can be switched off** | turn off *Include colour temperature* |
 | Battery | yes, battery models | — |
+| LED power (on/off) | **no** | shows the last power command, marked as assumed |
 | Effect | **no** | shows the last effect you selected |
 | Effect gear | **no** | shows the last gear you selected |
 | Fan speed | **no** | shows the last speed you selected |
@@ -267,10 +268,8 @@ Assistant would jump to something that is not what the light is doing. Turning
 *Include colour temperature* off leaves brightness polling untouched and keeps
 the colour slider on whatever was last commanded.
 
-**Live state can be polled on stock firmware** — no patch, no flashing. Turn on
-*Show the light's actual state* in the integration's options and Home Assistant
-asks the light what it is actually doing instead of showing what was last
-commanded:
+**Brightness and colour temperature can be polled on stock firmware** — no
+patch, no flashing. Turn on *Poll light status* in the integration's options:
 
 - **Brightness** is live, including changes made on the light's own control
   panel. Verified on an SL200III Bi and an SL60II Bi.
@@ -281,14 +280,19 @@ commanded:
   which. If your light reports a colour temperature that is not its real
   setting, turn off *Include colour temperature*.
 - **Battery** is read the same way, on stock firmware.
+- **LED power** is a separate command and has no confirmed readback. The
+  brightness record keeps its last value after the LEDs are switched off. Home
+  Assistant therefore keeps the last commanded power state and marks it as
+  assumed. An explicit *Turn on* command always reasserts power, including if
+  the light was switched off outside Home Assistant.
 
-With polling on, a light that stops answering — powered off, or out of range —
+With polling on, a light that stops answering — unpowered, or out of range —
 shows **unavailable** after a few missed polls, and comes back when it answers
 again. A light without polling has no such signal, so it always shows its last
 commanded state and stays available.
 
-With polling off, every entity is `assumed_state` and shows what was last
-commanded. See [docs/readback-hardware-findings.md](docs/readback-hardware-findings.md)
+The light's on/off state remains `assumed_state` with polling enabled or
+disabled. See [docs/readback-hardware-findings.md](docs/readback-hardware-findings.md)
 for exactly what was measured, on which light.
 
 **Battery** needs no patch either. Godox does not implement the standard
@@ -298,9 +302,8 @@ stock firmware. Enable polling and a sensor appears for each battery-capable
 model. Mains-powered lights (most of the range, including the SL200III Bi) have
 no battery and get no sensor.
 
-> The battery record was only ever read from a *mains* light, which answers a
-> constant 100 %. That it responds on stock firmware is measured; that a real
-> battery light reports a *changing* percentage is expected but untested.
+An FL15Bi returned 25% from its battery record on stock firmware. A first
+request missed during Home Assistant startup is retried within a minute.
 
 ## Troubleshooting
 

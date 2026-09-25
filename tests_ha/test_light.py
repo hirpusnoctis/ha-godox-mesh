@@ -93,6 +93,18 @@ async def test_turn_on_sends_brightness_and_kelvin(
     assert hass.states.get(ENTITY).state == STATE_ON
 
 
+async def test_turn_on_reasserts_power_when_state_was_already_on(
+    hass: HomeAssistant, setup_entry, mock_commands
+) -> None:
+    """A second on command must recover from an external physical switch-off."""
+    for _ in range(2):
+        await hass.services.async_call(
+            "light", SERVICE_TURN_ON, {ATTR_ENTITY_ID: ENTITY}, blocking=True
+        )
+
+    assert mock_commands["power_on"].await_count == 2
+
+
 async def test_brightness_is_scaled_to_percent(
     hass: HomeAssistant, setup_entry, mock_commands
 ) -> None:

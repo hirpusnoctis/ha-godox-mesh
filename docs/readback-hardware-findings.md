@@ -1,12 +1,26 @@
 # Status readback: what the hardware actually does
 
-This document records what two real lights do. Where it and the static-analysis
+This document records what three real lights do. Where it and the static-analysis
 documents ([state-readback-investigation.md](state-readback-investigation.md),
 [bt-chip-firmware.md](bt-chip-firmware.md)) differ on readback, this one is
 authoritative.
 
 Verified on an **SL200III Bi** (`radioId` 003F, LK8620 chip, BLE firmware
 version 66 / `0x42`), stock firmware, no patch.
+
+## FL15Bi power and battery readback
+
+On an **FL15Bi** (`radioId` 009F, LK8728B), the LEDs physically switched on
+after an `FE 00` command and off after `FE 01`. The selected `A0` record still
+reported 10% / 2800 K on successive polls in **both** power states. That record
+is the saved brightness and colour setting, not LED on/off state. The `A6`
+battery record returned 25% and `state=2` both with the LEDs on and off, so its
+`state` byte does not encode LED power on this model. The vendor app does not
+request power readback either; see [model-support.md](model-support.md).
+
+Home Assistant must keep the last commanded power state as assumed. A command
+to turn on must send `FE 00` even if the assumed state is already on, because a
+physical control or another app may have switched the LEDs off meanwhile.
 
 ## Selecting the record
 

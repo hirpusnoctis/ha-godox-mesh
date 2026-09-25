@@ -31,7 +31,15 @@ COMMAND_ECHO = "a06441320000000c"  # 100% / 6500K, written by a command
 PANEL_WRITE = "a04d3800ffff01f0"  # 77%, written by the light's own knob
 
 
-async def _setup(hass: HomeAssistant, *, readback: bool) -> MockConfigEntry:
+async def _setup(
+    hass: HomeAssistant, *, readback: bool, restore_on: bool = False
+) -> MockConfigEntry:
+    if restore_on:
+        from homeassistant.const import STATE_ON
+        from homeassistant.core import State
+        from pytest_homeassistant_custom_component.common import mock_restore_cache
+
+        mock_restore_cache(hass, [State(ENTITY, STATE_ON)])
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="Key",
@@ -59,18 +67,67 @@ async def test_polling_off_keeps_the_state_assumed(hass: HomeAssistant) -> None:
 
 
 @pytest.mark.usefixtures("fake_ble")
+async def test_status_brightness_does_not_override_power_commands(
+    hass: HomeAssistant,
+) -> None:
+    """A0 keeps the last brightness after FE turns a FL15Bi's LEDs off."""
+    from datetime import timedelta
+
+    from homeassistant.const import ATTR_ENTITY_ID, STATE_OFF, STATE_ON
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    from custom_components.godox_mesh.const import CONF_POLL_INTERVAL
+
+    # Observed on the FL15Bi at 10% / 2800 K both before and after power-off.
+    status = parse_status_response(bytes.fromhex("a00a1c32000000a5"))
+    poll = AsyncMock(return_value=status)
+    with patch.object(GodoxMeshLink, "async_request_status", poll):
+        await _setup_nodes(
+            hass,
+            [
+                {
+                    CONF_NODE_ADDRESS: 2,
+                    CONF_NAME: "Key",
+                    CONF_RADIO_ID: "009F",
+                    CONF_READBACK: True,
+                    CONF_POLL_INTERVAL: 10,
+                }
+            ],
+        )
+        assert hass.states.get(ENTITY).state == STATE_OFF
+        assert hass.states.get(ENTITY).attributes[ATTR_ASSUMED_STATE] is True
+
+        await hass.services.async_call(
+            "light", "turn_on", {ATTR_ENTITY_ID: ENTITY}, blocking=True
+        )
+        assert hass.states.get(ENTITY).state == STATE_ON
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=11))
+        await hass.async_block_till_done()
+        assert hass.states.get(ENTITY).state == STATE_ON
+
+        await hass.services.async_call(
+            "light", "turn_off", {ATTR_ENTITY_ID: ENTITY}, blocking=True
+        )
+        assert hass.states.get(ENTITY).state == STATE_OFF
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=22))
+        await hass.async_block_till_done()
+        assert hass.states.get(ENTITY).state == STATE_OFF
+
+
+@pytest.mark.usefixtures("fake_ble")
 async def test_polling_reports_live_brightness(hass: HomeAssistant) -> None:
     """A polled light shows the brightness the hardware reports."""
     status = parse_status_response(bytes.fromhex(PANEL_WRITE))
     with patch.object(
         GodoxMeshLink, "async_request_status", AsyncMock(return_value=status)
     ):
-        await _setup(hass, readback=True)
+        await _setup(hass, readback=True, restore_on=True)
         state = hass.states.get(ENTITY)
         # 77% of the 1-100 scale, converted to Home Assistant's 0-255.
         assert state.attributes[ATTR_BRIGHTNESS] == pytest.approx(196, abs=2)
-        # Brightness is real, so the state is no longer assumed.
-        assert state.attributes.get(ATTR_ASSUMED_STATE) is not True
+        # The level is polled, but the separate power switch remains assumed.
+        assert state.attributes[ATTR_ASSUMED_STATE] is True
 
 
 @pytest.mark.usefixtures("fake_ble")
@@ -80,7 +137,7 @@ async def test_polling_accepts_cct_from_a_command_echo(hass: HomeAssistant) -> N
     with patch.object(
         GodoxMeshLink, "async_request_status", AsyncMock(return_value=status)
     ):
-        await _setup(hass, readback=True)
+        await _setup(hass, readback=True, restore_on=True)
         assert hass.states.get(ENTITY).attributes[ATTR_COLOR_TEMP_KELVIN] == 6500
 
 
@@ -97,7 +154,7 @@ async def test_polling_uses_the_reported_cct(hass: HomeAssistant) -> None:
     with patch.object(
         GodoxMeshLink, "async_request_status", AsyncMock(return_value=status)
     ):
-        await _setup(hass, readback=True)
+        await _setup(hass, readback=True, restore_on=True)
         assert hass.states.get(ENTITY).attributes[ATTR_COLOR_TEMP_KELVIN] == status.cct
 
 
@@ -114,7 +171,7 @@ async def test_a_model_that_reports_live_cct_has_it_used(hass: HomeAssistant) ->
     with patch.object(
         GodoxMeshLink, "async_request_status", AsyncMock(return_value=live)
     ):
-        await _setup(hass, readback=True)
+        await _setup(hass, readback=True, restore_on=True)
         assert hass.states.get(ENTITY).attributes[ATTR_COLOR_TEMP_KELVIN] == 4000
 
 
@@ -169,6 +226,11 @@ async def test_colour_temperature_polling_can_be_turned_off(
     """
     from custom_components.godox_mesh.const import CONF_POLL_CCT
     from homeassistant.components.light import ATTR_BRIGHTNESS
+    from homeassistant.const import STATE_ON
+    from homeassistant.core import State
+    from pytest_homeassistant_custom_component.common import mock_restore_cache
+
+    mock_restore_cache(hass, [State(ENTITY, STATE_ON)])
 
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -207,12 +269,17 @@ async def test_colour_temperature_polling_can_be_turned_off(
 async def test_brightness_polling_can_be_turned_off(hass: HomeAssistant) -> None:
     """A user whose light reports a wrong brightness can opt out of trusting it.
 
-    On/off and colour temperature keep updating; only the brightness level is
+    Colour temperature keeps updating; only the brightness level is
     left at what was last commanded. This is the escape hatch for a light that
     reports a brightness which is not its real setting (some do after a firmware
     glitch, until power-cycled).
     """
     from custom_components.godox_mesh.const import CONF_POLL_BRIGHTNESS
+    from homeassistant.const import STATE_ON
+    from homeassistant.core import State
+    from pytest_homeassistant_custom_component.common import mock_restore_cache
+
+    mock_restore_cache(hass, [State(ENTITY, STATE_ON)])
 
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -243,7 +310,7 @@ async def test_brightness_polling_can_be_turned_off(hass: HomeAssistant) -> None
     # The reported 77% (~196 on the 0-255 scale) was not applied: the level
     # stays at what was last commanded (the entity's default of full).
     assert state.attributes[ATTR_BRIGHTNESS] == 255
-    # ... but on/off is still inferred from the poll, which reported non-zero.
+    # Power is restored from the last command, not inferred from brightness.
     assert state.state == "on"
 
 
@@ -271,9 +338,8 @@ async def test_a_node_setting_overrides_the_entry_wide_fallback(
     from custom_components.godox_mesh.const import CONF_POLL_INTERVAL  # noqa: F401
 
     status = parse_status_response(bytes.fromhex(PANEL_WRITE))
-    with patch.object(
-        GodoxMeshLink, "async_request_status", AsyncMock(return_value=status)
-    ):
+    poll = AsyncMock(return_value=status)
+    with patch.object(GodoxMeshLink, "async_request_status", poll):
         await _setup_nodes(
             hass,
             [
@@ -286,16 +352,15 @@ async def test_a_node_setting_overrides_the_entry_wide_fallback(
             ],
             **{CONF_READBACK: True},
         )
-    assert hass.states.get(ENTITY).attributes[ATTR_ASSUMED_STATE] is True
+    poll.assert_not_awaited()
 
 
 @pytest.mark.usefixtures("fake_ble")
 async def test_readback_is_per_node(hass: HomeAssistant) -> None:
     """One node can poll while a sibling on the same mesh does not."""
     status = parse_status_response(bytes.fromhex(PANEL_WRITE))
-    with patch.object(
-        GodoxMeshLink, "async_request_status", AsyncMock(return_value=status)
-    ):
+    poll = AsyncMock(return_value=status)
+    with patch.object(GodoxMeshLink, "async_request_status", poll):
         await _setup_nodes(
             hass,
             [
@@ -313,7 +378,8 @@ async def test_readback_is_per_node(hass: HomeAssistant) -> None:
                 },
             ],
         )
-    assert hass.states.get("light.key").attributes.get(ATTR_ASSUMED_STATE) is not True
+    poll.assert_awaited_once_with(2)
+    assert hass.states.get("light.key").attributes[ATTR_ASSUMED_STATE] is True
     assert hass.states.get("light.fill").attributes[ATTR_ASSUMED_STATE] is True
 
 

@@ -73,18 +73,16 @@ async def async_setup_entry(
     entry_address = entry.unique_id or entry.data[CONF_ADDRESS]
     # Readback/poll settings are per-node now (on GodoxNode); the light reads
     # them itself and drives its own poll timer, so nothing entry-wide here.
-    async_add_entities(
-        GodoxLight(data, node, entry_address) for node in data.nodes
-    )
+    async_add_entities(GodoxLight(data, node, entry_address) for node in data.nodes)
 
 
 class GodoxLight(LightEntity, RestoreEntity):
     """A Godox mesh light addressed by unicast address.
 
     Brightness and colour temperature can be polled from the light on stock
-    firmware, when the user opts in; effect and effect speed never can, so those
-    always show what was last commanded. State is restored across restarts so
-    that a brightness change does not first have to guess a starting point.
+    firmware, when the user opts in. LED power, effect and effect speed cannot
+    be read back, so they show what was last commanded. State is restored
+    across restarts so a brightness change has a starting point.
     """
 
     _attr_has_entity_name = True
@@ -102,10 +100,9 @@ class GodoxLight(LightEntity, RestoreEntity):
         self._data = data
         self._link = data.link
         self._node = node
-        # Readback is per-light and driven by a timer (see async_added_to_hass),
-        # not Home Assistant's poll loop -- so a light without it shows what was
-        # last commanded (assumed state).
-        self._attr_assumed_state = not node.readback
+        # The A0 status record reports the saved brightness, not the FE power
+        # switch. Power remains assumed even when brightness/CCT are polled.
+        self._attr_assumed_state = True
         # Consecutive failed polls. A polled light that stops answering is shown
         # unavailable after a few; an un-polled light never polls, so it has no
         # availability signal and stays available (the default).
@@ -118,8 +115,12 @@ class GodoxLight(LightEntity, RestoreEntity):
         # own colour-temperature range, and a full-colour light additionally
         # gets hue/saturation and, where the model has them, direct channels.
         modes = caps.color_modes_for(use_xy=node.use_xy)
-        mode = caps.color_mode if ColorMode.XY not in modes else (
-            ColorMode.COLOR_TEMP if ColorMode.COLOR_TEMP in modes else ColorMode.XY
+        mode = (
+            caps.color_mode
+            if ColorMode.XY not in modes
+            else (
+                ColorMode.COLOR_TEMP if ColorMode.COLOR_TEMP in modes else ColorMode.XY
+            )
         )
         self._attr_supported_color_modes = modes
         self._attr_color_mode = mode
@@ -222,7 +223,8 @@ class GodoxLight(LightEntity, RestoreEntity):
             self._attr_brightness = int(brightness)
         if (
             ColorMode.COLOR_TEMP in self._attr_supported_color_modes
-            and (kelvin := last_state.attributes.get(ATTR_COLOR_TEMP_KELVIN)) is not None
+            and (kelvin := last_state.attributes.get(ATTR_COLOR_TEMP_KELVIN))
+            is not None
         ):
             self._attr_color_temp_kelvin = self._clamp_kelvin(int(kelvin))
         # Colour has to come back too, and with the mode that produced it: a
@@ -351,9 +353,7 @@ class GodoxLight(LightEntity, RestoreEntity):
         self._attr_effect = None
         self.async_write_ha_state()
         if self._attr_is_on:
-            self.hass.async_create_task(
-                self._async_send_color(self._brightness_pct())
-            )
+            self.hass.async_create_task(self._async_send_color(self._brightness_pct()))
 
     def _brightness_pct(self) -> float:
         """Brightness as the percentage the wire carries.
@@ -408,8 +408,9 @@ class GodoxLight(LightEntity, RestoreEntity):
         if (effect := kwargs.get(ATTR_EFFECT)) is not None:
             self._attr_effect = None if effect == EFFECT_OFF else effect
 
-        if not self._attr_is_on:
-            await self._link.async_turn_on(self._node.address)
+        # FE power state is not readable. Reassert ON even if the last command
+        # was ON: the panel or app may have switched the LEDs off since then.
+        await self._link.async_turn_on(self._node.address)
 
         brightness_pct = self._brightness_pct()
         # The gel control's command carries brightness too, so it needs to know
@@ -564,9 +565,10 @@ class GodoxLight(LightEntity, RestoreEntity):
     async def async_update(self) -> None:
         """Poll the light for its live state.
 
-        What the light reports is shown as-is. Most lights report both fields
-        accurately; a few send a colour temperature that is not their real
-        setting after it is changed on the light's own controls. Rather than
+        The A0 brightness and colour temperature are shown as reported, but A0
+        does not carry the FE on/off state. A few lights send a colour
+        temperature that is not their real setting after it is changed on
+        the light's own controls. Rather than
         guess which is which from the wire format -- two attempts at that were
         wrong, and a wrong guess silently discards a good value with no way for
         the user to override it -- colour temperature can simply be switched
@@ -583,17 +585,10 @@ class GodoxLight(LightEntity, RestoreEntity):
             _LOGGER.debug("status poll for %s failed: %s", self._node.name, err)
             return
         self._mark_reachable()
-        if status.brightness:
-            # On/off is inferred from the poll regardless; the reported level is
-            # trusted only when brightness readback is on. Off keeps the level
-            # last commanded -- useful if a light reports a wrong brightness.
-            if self._poll_brightness:
-                self._attr_brightness = value_to_brightness(
-                    BRIGHTNESS_SCALE, status.brightness
-                )
-            self._attr_is_on = True
-        elif status.brightness == 0:
-            self._attr_is_on = False
+        if status.brightness and self._poll_brightness:
+            self._attr_brightness = value_to_brightness(
+                BRIGHTNESS_SCALE, status.brightness
+            )
         # Only meaningful while the light is actually in colour-temperature
         # mode; the 0xA0 record's second byte is the effect symbol otherwise,
         # and the library has already declined to read it as Kelvin.
@@ -606,9 +601,7 @@ class GodoxLight(LightEntity, RestoreEntity):
 
     def _clamp_kelvin(self, kelvin: int) -> int:
         """Clamp a colour temperature into the range currently selected."""
-        return max(
-            self.min_color_temp_kelvin, min(self.max_color_temp_kelvin, kelvin)
-        )
+        return max(self.min_color_temp_kelvin, min(self.max_color_temp_kelvin, kelvin))
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the light off."""
@@ -616,7 +609,3 @@ class GodoxLight(LightEntity, RestoreEntity):
         self._attr_is_on = False
         self._mark_reachable()
         self.async_write_ha_state()
-
-
-
-

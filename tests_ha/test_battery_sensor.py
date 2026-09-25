@@ -89,3 +89,25 @@ async def test_battery_sensor_unavailable_when_light_does_not_answer(
         state = hass.states.get("sensor.light_battery")
         assert state is not None
         assert state.state in ("unknown", "unavailable")
+
+
+@pytest.mark.usefixtures("fake_ble")
+async def test_battery_retries_soon_after_startup_timeout(hass: HomeAssistant) -> None:
+    """A missed first request must not leave battery unknown for ten minutes."""
+    from datetime import timedelta
+
+    from homeassistant.exceptions import HomeAssistantError
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    request = AsyncMock(side_effect=[HomeAssistantError("startup timeout"), 25])
+    with patch.object(GodoxMeshLink, "async_request_battery", request):
+        await _setup(hass, _entry(readback=True, radio_id="009F"))
+        assert hass.states.get("sensor.light_battery").state in (
+            "unknown",
+            "unavailable",
+        )
+
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
+        await hass.async_block_till_done()
+        assert hass.states.get("sensor.light_battery").state == "25"

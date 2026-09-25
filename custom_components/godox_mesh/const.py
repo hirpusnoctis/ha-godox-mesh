@@ -66,10 +66,10 @@ CONF_MESH_STATE_JSON: Final = "mesh_state_json"
 CONF_MODEL: Final = "model"
 # The 4-hex Godox radioId (e.g. "003F"), the key into per-model capabilities.
 CONF_RADIO_ID: Final = "radio_id"
-# Opt-in: poll the light for its actual state instead of assuming the last
-# command took effect. This works on **stock** firmware -- no patch is required
-# for brightness, commanded colour temperature, or battery. Off by default only
-# because polling costs a round trip per update.
+# Opt-in: poll brightness and colour temperature, and detect loss of contact.
+# The separate power switch has no readback and stays based on the last command.
+# Polling works on stock firmware; it is off by default because it costs a
+# round trip per update.
 CONF_READBACK: Final = "readback"
 # Some lights report a colour temperature that is not their real setting after
 # it is changed on the light's own panel: the SL200III Bi does this, the SL60II
@@ -79,7 +79,7 @@ CONF_READBACK: Final = "readback"
 CONF_POLL_CCT: Final = "poll_cct"
 # Whether to trust the light's reported brightness. On by default; a user can
 # switch it off to keep the commanded brightness if their light reports a wrong
-# level (some do after a firmware glitch), while still reading colour and state.
+# level (some do after a firmware glitch), while still reading colour.
 CONF_POLL_BRIGHTNESS: Final = "poll_brightness"
 # How often (seconds) to poll a light for its live state, when readback is on.
 # Per-node; the entry-wide value, if any, is only a migration fallback.
@@ -174,9 +174,9 @@ DROP_PENALTY_SECONDS: Final = 180.0
 # only availability signal they get -- an un-polled light stays available.
 FAILED_POLLS_BEFORE_UNAVAILABLE: Final = 3
 
-# How often to poll a light for battery charge. Battery moves slowly and
-# each poll wakes the shared connection, so this is deliberately infrequent.
-BATTERY_POLL_SECONDS: Final = 600.0
+# A missed startup reply should recover promptly. Status polling already keeps
+# the proxy link active on readback-enabled battery lights.
+BATTERY_POLL_SECONDS: Final = 60.0
 
 # The device only acknowledges proxy filter configuration during the original
 # provisioning session, so on every later connection the library's default
