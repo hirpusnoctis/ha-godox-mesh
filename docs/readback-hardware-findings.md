@@ -18,6 +18,30 @@ battery record returned 25% and `state=2` both with the LEDs on and off, so its
 `state` byte does not encode LED power on this model. The vendor app does not
 request power readback either; see [model-support.md](model-support.md).
 
+A second live check on the FL15Bi queried every documented `FD 01` selector
+`A0`–`AA`. Only `A0`, `A1`, and `A6` answered. `A0` still reported the saved
+brightness/colour setting after the LEDs were turned off; `A1` stayed unchanged.
+We also sent the standard Bluetooth Mesh Generic OnOff Get (`82 01`) to both
+elements. Both returned Generic OnOff Status `82 04 01`. Further status reports
+remained `82 04 01` across vendor `FE 00` (LEDs on) and `FE 01` (LEDs off)
+commands. The `01` is therefore the SIG model's own state, **not a reliable
+reading of this light's LEDs**. It must not drive Home Assistant's `is_on`.
+
+Three more standard Mesh queries to element `0002` also returned the same
+values after `FE 01` and `FE 00`:
+
+| Query | Reply with LEDs off | Reply after power-on command | Meaning |
+|---|---|---|---|
+| Generic Level Get `82 05` | `82 08 ff 7f` | `82 08 ff 7f` | maximum level |
+| Light Lightness Get `82 4b` | `82 4e ff ff` | `82 4e ff ff` | maximum lightness |
+| Light CTL Get `82 5d` | `82 60 ff ff 20 4e` | `82 60 ff ff 20 4e` | maximum lightness, 20000 K |
+
+These SIG model values are independent of the vendor LED command. In
+particular, treating their nonzero level as proof of emitted light would show
+the FL15Bi as on while its LEDs are off. The manufacturer's manual documents
+Bluetooth app control but no LED-state query; the app's own protocol handling
+does not request one either.
+
 Home Assistant must keep the last commanded power state as assumed. A command
 to turn on must send `FE 00` even if the assumed state is already on, because a
 physical control or another app may have switched the LEDs off meanwhile.
