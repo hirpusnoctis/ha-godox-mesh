@@ -102,7 +102,40 @@ async def test_turn_on_reasserts_power_when_state_was_already_on(
             "light", SERVICE_TURN_ON, {ATTR_ENTITY_ID: ENTITY}, blocking=True
         )
 
-    assert mock_commands["power_on"].await_count == 2
+    assert mock_commands["power_on"].await_count == 4
+
+
+async def test_turn_on_survives_silent_loss_of_first_power_write(
+    hass: HomeAssistant, setup_entry, mock_commands
+) -> None:
+    """A saved colour update cannot stand in for LEDs physically turning on."""
+    writes: list[str] = []
+    leds_on = False
+
+    async def power_on(*, dst: int) -> None:
+        nonlocal leds_on
+        assert dst == 2
+        writes.append("power_on")
+        # Mesh Proxy writes are unacknowledged: the first write can be accepted
+        # by BlueZ without reaching the light.
+        if writes.count("power_on") > 1:
+            leds_on = True
+
+    async def set_params(**_kwargs) -> None:
+        writes.append("set_params")
+
+    mock_commands["power_on"].side_effect = power_on
+    mock_commands["set_params"].side_effect = set_params
+
+    await hass.services.async_call(
+        "light",
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: ENTITY, ATTR_BRIGHTNESS: 255, ATTR_COLOR_TEMP_KELVIN: 2800},
+        blocking=True,
+    )
+
+    assert leds_on
+    assert writes == ["power_on", "set_params", "power_on"]
 
 
 async def test_brightness_is_scaled_to_percent(

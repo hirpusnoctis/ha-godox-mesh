@@ -420,6 +420,11 @@ class GodoxLight(LightEntity, RestoreEntity):
             await self._async_send_effect(brightness_pct)
         else:
             await self._async_send_color(brightness_pct)
+        # Proxy writes have no application acknowledgement. On the FL15Bi we
+        # observed the colour frame taking effect while the preceding FE ON
+        # did not light the LEDs. Reassert the idempotent power command after
+        # the colour/effect frame so a lost first write cannot leave them off.
+        await self._link.async_turn_on(self._node.address)
         self._attr_is_on = True
         # A successful command is proof the light is reachable, so reset the
         # failed-poll strike count -- this keeps a light that answers commands

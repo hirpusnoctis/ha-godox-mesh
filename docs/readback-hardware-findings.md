@@ -50,6 +50,15 @@ Home Assistant must keep the last commanded power state as assumed. A command
 to turn on must send `FE 00` even if the assumed state is already on, because a
 physical control or another app may have switched the LEDs off meanwhile.
 
+During a later FL15Bi test, Home Assistant's colour command reached the light
+(30% / 4000 K appeared on its panel after the LEDs were lit locally), but its
+preceding `FE 00` did not illuminate the LEDs. The cause was not confirmed:
+Mesh Proxy writes carry no application acknowledgement, and the light provides
+no usable LED-power reply. The integration now sends a second, idempotent
+`FE 00` after the colour or effect frame to cover a missed first power write.
+This improves command delivery but does not turn the assumed power state into
+a measured one.
+
 ## Selecting the record
 
 The status request's end byte is not padding — it *selects which record the
