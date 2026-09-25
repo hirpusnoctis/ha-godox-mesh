@@ -17,6 +17,10 @@ is the saved brightness and colour setting, not LED on/off state. The `A6`
 battery record returned 25% and `state=2` both with the LEDs on and off, so its
 `state` byte does not encode LED power on this model. The vendor app does not
 request power readback either; see [model-support.md](model-support.md).
+Logging the complete `A6` reply before and after another power-on command
+confirmed that **all bytes stayed identical**, including the remaining-runtime
+fields (`ff ff`). Battery telemetry therefore cannot distinguish whether the
+LEDs are emitting light.
 
 A second live check on the FL15Bi queried every documented `FD 01` selector
 `A0`–`AA`. Only `A0`, `A1`, and `A6` answered. `A0` still reported the saved
