@@ -58,6 +58,11 @@ _LOGGER = logging.getLogger(__name__)
 PARALLEL_UPDATES = 1
 
 DEFAULT_KELVIN = 5600
+# A proxy GATT write only confirms that the gateway accepted a frame. The
+# target may not retain the requested value; let its A0 record settle before
+# checking, then retry the idempotent colour frame a bounded number of times.
+COLOR_CONFIRM_DELAY_SECONDS = 0.35
+COLOR_WRITE_ATTEMPTS = 3
 
 
 async def async_setup_entry(
@@ -390,6 +395,7 @@ class GodoxLight(LightEntity, RestoreEntity):
         was in, effects included. So exactly one is chosen here, from whichever
         attribute the service call carried.
         """
+        previous_brightness = self._attr_brightness
         if (kelvin := kwargs.get(ATTR_COLOR_TEMP_KELVIN)) is not None:
             # Home Assistant does not clamp to the entity's advertised range,
             # and the library rejects anything outside it.
@@ -436,6 +442,16 @@ class GodoxLight(LightEntity, RestoreEntity):
         # the colour/effect frame so a lost first write cannot leave them off.
         await self._link.async_turn_on(self._node.address)
         self._attr_is_on = True
+        if (
+            brightness is not None
+            and self._node.readback
+            and self._poll_brightness
+            and self._node.capabilities.brightness_steps == 100
+            and self._attr_effect is None
+            and self._attr_color_mode is ColorMode.COLOR_TEMP
+            and not self._selfie
+        ):
+            await self._async_confirm_brightness(brightness_pct, previous_brightness)
         # A successful command is proof the light is reachable, so reset the
         # failed-poll strike count -- this keeps a light that answers commands
         # but is slow to answer a status poll from drifting to unavailable. It
@@ -457,6 +473,55 @@ class GodoxLight(LightEntity, RestoreEntity):
             async_dispatcher_send(
                 self.hass, SIGNAL_XY_CHANGED.format(node_id=self._attr_unique_id)
             )
+
+    async def _async_confirm_brightness(
+        self, requested_pct: float, previous_brightness: int | None
+    ) -> None:
+        """Check the node's A0 value, retrying an unconfirmed CCT frame."""
+        last_reported: int | None = None
+        for attempt in range(1, COLOR_WRITE_ATTEMPTS + 1):
+            await asyncio.sleep(COLOR_CONFIRM_DELAY_SECONDS)
+            try:
+                status = await self._link.async_request_status(self._node.address)
+            except HomeAssistantError as err:
+                _LOGGER.debug(
+                    "%s brightness confirmation %s/%s failed: %s",
+                    self._node.name,
+                    attempt,
+                    COLOR_WRITE_ATTEMPTS,
+                    err,
+                )
+            else:
+                last_reported = status.brightness
+                if status.brightness == round(requested_pct):
+                    self._mark_reachable()
+                    return
+                _LOGGER.warning(
+                    "%s did not retain brightness %s%% (read back %s%%); write %s/%s",
+                    self._node.name,
+                    requested_pct,
+                    status.brightness,
+                    attempt,
+                    COLOR_WRITE_ATTEMPTS,
+                )
+            if attempt < COLOR_WRITE_ATTEMPTS:
+                # FE already asserted power. Re-send only the idempotent F0
+                # frame, leaving enough time for the node to process each one.
+                await self._async_send_color(requested_pct)
+
+        # Keep HA at the last measured brightness and report the failed command
+        # instead of briefly showing an optimistic level that the poll undoes.
+        if last_reported:
+            self._attr_brightness = value_to_brightness(BRIGHTNESS_SCALE, last_reported)
+            self._data.brightness_pct[self._node.address] = float(last_reported)
+            self._mark_reachable()
+        else:
+            self._attr_brightness = previous_brightness
+        self.async_write_ha_state()
+        raise HomeAssistantError(
+            f"{self._node.name} did not confirm brightness {requested_pct}% "
+            f"after {COLOR_WRITE_ATTEMPTS} writes (last read: {last_reported}%)"
+        )
 
     async def _async_send_effect(self, brightness_pct: float) -> None:
         """Send the current effect at the current speed."""

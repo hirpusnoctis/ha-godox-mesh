@@ -59,6 +59,18 @@ no usable LED-power reply. The integration now sends a second, idempotent
 This improves command delivery but does not turn the assumed power state into
 a measured one.
 
+On 2026-09-26, a separate FL15Bi brightness failure was captured: HA sent a
+16% / 2800 K colour frame without a transport error, but the next two `A0`
+polls still reported 100% / 2800 K. The UI briefly showed the requested 16%
+before reverting to the actual saved level. A successful proxy GATT write is
+therefore not proof that the destination node applied a colour frame either.
+For an explicit brightness command to a readback-enabled, whole-percent CCT
+light, the integration now checks `A0` after a short settling interval. It
+re-sends the same idempotent colour frame up to two times if the brightness
+does not match, and reports an error while retaining the last measured value
+if all three writes go unconfirmed. This check does not establish whether the
+LEDs are physically on, since their power switch remains unreadable.
+
 ## Selecting the record
 
 The status request's end byte is not padding — it *selects which record the

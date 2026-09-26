@@ -224,6 +224,94 @@ async def test_poll_cannot_replace_requested_brightness_during_turn_on(
 
 
 @pytest.mark.usefixtures("fake_ble")
+async def test_lost_colour_write_is_retried_after_readback_mismatch(
+    hass: HomeAssistant,
+) -> None:
+    """A successful BLE write alone does not prove the light applied its level."""
+    from homeassistant.components.light import ATTR_BRIGHTNESS_PCT
+
+    reads = 0
+
+    async def request_status(_self: GodoxMeshLink, _node: int) -> StatusResponse:
+        nonlocal reads
+        reads += 1
+        # Setup reads 100%. The first command is silently lost; the next F0
+        # write reaches the light and its readback changes to 16%.
+        brightness = 100 if reads <= 2 else 16
+        return StatusResponse(0xA0, brightness, 2800, None, 0, b"")
+
+    set_light = AsyncMock()
+    with (
+        patch.object(GodoxMeshLink, "async_request_status", request_status),
+        patch.object(GodoxMeshLink, "async_turn_on", AsyncMock()),
+        patch.object(GodoxMeshLink, "async_set_light", set_light),
+    ):
+        await _setup_nodes(
+            hass,
+            [
+                {
+                    CONF_NODE_ADDRESS: 2,
+                    CONF_NAME: "Key",
+                    CONF_RADIO_ID: "009F",
+                    CONF_READBACK: True,
+                }
+            ],
+        )
+        await hass.services.async_call(
+            "light",
+            "turn_on",
+            {ATTR_ENTITY_ID: ENTITY, ATTR_BRIGHTNESS_PCT: 16},
+            blocking=True,
+        )
+
+    assert set_light.await_count == 2
+    assert [c.kwargs["brightness_pct"] for c in set_light.await_args_list] == [16, 16]
+    assert hass.states.get(ENTITY).attributes[ATTR_BRIGHTNESS] == pytest.approx(
+        41, abs=2
+    )
+
+
+@pytest.mark.usefixtures("fake_ble")
+async def test_unconfirmed_colour_write_reports_failure_and_real_level(
+    hass: HomeAssistant,
+) -> None:
+    """Repeated mismatches must not leave HA claiming the requested level."""
+    from homeassistant.components.light import ATTR_BRIGHTNESS_PCT
+    from homeassistant.exceptions import HomeAssistantError
+
+    status = StatusResponse(0xA0, 100, 2800, None, 0, b"")
+    set_light = AsyncMock()
+    with (
+        patch.object(
+            GodoxMeshLink, "async_request_status", AsyncMock(return_value=status)
+        ),
+        patch.object(GodoxMeshLink, "async_turn_on", AsyncMock()),
+        patch.object(GodoxMeshLink, "async_set_light", set_light),
+    ):
+        await _setup_nodes(
+            hass,
+            [
+                {
+                    CONF_NODE_ADDRESS: 2,
+                    CONF_NAME: "Key",
+                    CONF_RADIO_ID: "009F",
+                    CONF_READBACK: True,
+                }
+            ],
+        )
+        with pytest.raises(HomeAssistantError, match="did not confirm"):
+            await hass.services.async_call(
+                "light",
+                "turn_on",
+                {ATTR_ENTITY_ID: ENTITY, ATTR_BRIGHTNESS_PCT: 16},
+                blocking=True,
+            )
+
+    assert set_light.await_count == 3
+    assert hass.states.get(ENTITY).attributes[ATTR_BRIGHTNESS] == 255
+
+
+@pytest.mark.usefixtures("fake_ble")
 async def test_polling_accepts_cct_from_a_command_echo(hass: HomeAssistant) -> None:
     """A record written by a command reports the commanded colour temperature."""
     status = parse_status_response(bytes.fromhex(COMMAND_ECHO))
