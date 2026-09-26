@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 from typing import Any
@@ -100,6 +101,10 @@ class GodoxLight(LightEntity, RestoreEntity):
         self._data = data
         self._link = data.link
         self._node = node
+        # The timer calls async_update directly, outside Home Assistant's
+        # platform semaphore. Keep a poll from overwriting requested values
+        # between the power and colour writes of one light command.
+        self._command_poll_lock = asyncio.Lock()
         # The A0 status record reports the saved brightness, not the FE power
         # switch. Power remains assumed even when brightness/CCT are polled.
         self._attr_assumed_state = True
@@ -373,6 +378,11 @@ class GodoxLight(LightEntity, RestoreEntity):
         return float(max(1, round(raw)))
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        """Apply one complete light command without an intervening status poll."""
+        async with self._command_poll_lock:
+            await self._async_turn_on_locked(**kwargs)
+
+    async def _async_turn_on_locked(self, **kwargs: Any) -> None:
         """Turn the light on, and apply brightness, colour or effect.
 
         The protocol has one command per colour mode and they are mutually
@@ -568,6 +578,11 @@ class GodoxLight(LightEntity, RestoreEntity):
         self.async_write_ha_state()
 
     async def async_update(self) -> None:
+        """Poll once after any command in progress has finished."""
+        async with self._command_poll_lock:
+            await self._async_update_locked()
+
+    async def _async_update_locked(self) -> None:
         """Poll the light for its live state.
 
         The A0 brightness and colour temperature are shown as reported, but A0
@@ -609,6 +624,11 @@ class GodoxLight(LightEntity, RestoreEntity):
         return max(self.min_color_temp_kelvin, min(self.max_color_temp_kelvin, kelvin))
 
     async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn the light off after any command or poll in progress."""
+        async with self._command_poll_lock:
+            await self._async_turn_off_locked(**kwargs)
+
+    async def _async_turn_off_locked(self, **kwargs: Any) -> None:
         """Turn the light off."""
         await self._link.async_turn_off(self._node.address)
         self._attr_is_on = False

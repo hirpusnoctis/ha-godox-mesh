@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -15,11 +17,22 @@ from custom_components.godox_mesh.const import (
     DOMAIN,
 )
 from custom_components.godox_mesh.mesh import GodoxMeshLink
+from custom_components.godox_mesh.light import GodoxLight
+from custom_components.godox_mesh._lib.protocol import StatusResponse
 from homeassistant.components.light import ATTR_BRIGHTNESS, ATTR_COLOR_TEMP_KELVIN
-from homeassistant.const import ATTR_ASSUMED_STATE, CONF_ADDRESS, CONF_NAME
+from homeassistant.const import (
+    ATTR_ASSUMED_STATE,
+    ATTR_ENTITY_ID,
+    CONF_ADDRESS,
+    CONF_NAME,
+)
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+)
 
 from tests_ha.conftest import ADDRESS, MESH_STATE
 
@@ -128,6 +141,86 @@ async def test_polling_reports_live_brightness(hass: HomeAssistant) -> None:
         assert state.attributes[ATTR_BRIGHTNESS] == pytest.approx(196, abs=2)
         # The level is polled, but the separate power switch remains assumed.
         assert state.attributes[ATTR_ASSUMED_STATE] is True
+
+
+@pytest.mark.usefixtures("fake_ble")
+async def test_poll_cannot_replace_requested_brightness_during_turn_on(
+    hass: HomeAssistant,
+) -> None:
+    """A timer poll overlapping the first FE write must not change its F0 frame."""
+    current = StatusResponse(0xA0, 52, 2800, None, 0, b"")
+    first_power_started = asyncio.Event()
+    release_first_power = asyncio.Event()
+    poll_started = asyncio.Event()
+    sent_params: list[tuple[float, int]] = []
+    power_calls = 0
+
+    async def request_status(_self: GodoxMeshLink, _node: int) -> StatusResponse:
+        return current
+
+    async def turn_on(_self: GodoxMeshLink, _node: int) -> None:
+        nonlocal power_calls
+        power_calls += 1
+        if power_calls == 1:
+            first_power_started.set()
+            await release_first_power.wait()
+
+    async def set_light(_self: GodoxMeshLink, _node: int, **kwargs) -> None:
+        nonlocal current
+        brightness = kwargs["brightness_pct"]
+        kelvin = kwargs["kelvin"]
+        sent_params.append((brightness, kelvin))
+        current = StatusResponse(0xA0, round(brightness), kelvin, None, 0, b"")
+
+    with (
+        patch.object(GodoxMeshLink, "async_request_status", request_status),
+        patch.object(GodoxMeshLink, "async_turn_on", turn_on),
+        patch.object(GodoxMeshLink, "async_set_light", set_light),
+    ):
+        await _setup_nodes(
+            hass,
+            [
+                {
+                    CONF_NODE_ADDRESS: 2,
+                    CONF_NAME: "Key",
+                    CONF_RADIO_ID: "009F",
+                    CONF_READBACK: True,
+                }
+            ],
+        )
+
+        original_update = GodoxLight.async_update
+
+        async def tracked_update(self: GodoxLight) -> None:
+            poll_started.set()
+            await original_update(self)
+
+        with patch.object(GodoxLight, "async_update", tracked_update):
+            command = asyncio.create_task(
+                hass.services.async_call(
+                    "light",
+                    "turn_on",
+                    {
+                        ATTR_ENTITY_ID: ENTITY,
+                        ATTR_BRIGHTNESS: 94,  # 37%
+                        ATTR_COLOR_TEMP_KELVIN: 4000,
+                    },
+                    blocking=True,
+                )
+            )
+            await asyncio.wait_for(first_power_started.wait(), 5)
+            async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=11))
+            await asyncio.wait_for(poll_started.wait(), 5)
+            # Let an unlocked poll complete before the paused first FE write.
+            await asyncio.sleep(0)
+            release_first_power.set()
+            await command
+            await hass.async_block_till_done()
+
+    assert sent_params == [(37, 4000)]
+    assert hass.states.get(ENTITY).attributes[ATTR_BRIGHTNESS] == pytest.approx(
+        94, abs=2
+    )
 
 
 @pytest.mark.usefixtures("fake_ble")
